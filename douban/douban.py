@@ -13,23 +13,14 @@ try:
 except ImportError:
     from Queue import Empty, Queue
 
+import re
 from calibre.ebooks.metadata import check_isbn
 from calibre.ebooks.metadata.sources.base import Option, Source
 from calibre.ebooks.metadata.book.base import Metadata
 from calibre import as_unicode
 
-NAMESPACES = {
-    'openSearch': 'http://a9.com/-/spec/opensearchrss/1.0/',
-    'atom': 'http://www.w3.org/2005/Atom',
-    'db': 'https://www.douban.com/xmlns/',
-    'gd': 'http://schemas.google.com/g/2005'
-}
-
-
 def get_details(browser, url, timeout):  # {{{
     try:
-        if Douban.DOUBAN_API_KEY:
-            url = url + "?apikey=" + Douban.DOUBAN_API_KEY
         raw = browser.open_novisit(url, timeout=timeout).read()
     except Exception as e:
         gc = getattr(e, 'getcode', lambda: -1)
@@ -65,8 +56,9 @@ class Douban(Source):
     supports_gzip_transfer_encoding = True
     cached_cover_url_is_reliable = True
 
-    DOUBAN_API_KEY = '054022eaeae0b00e0fc068c0c0a2102a'
-    DOUBAN_API_URL = 'https://api.douban.com/v2/book/search'
+    # DOUBAN_API_KEY = ''
+    BASE_URL = 'https://www.douban.com/j/search?t=book&p=0&'
+    # DOUBAN_API_URL = 'https://m.douban.com/j/search/?q=starwars&t=book&p=0'
     DOUBAN_BOOK_URL = 'https://book.douban.com/subject/%s/'
 
     options = (
@@ -78,32 +70,76 @@ class Douban(Source):
     )
 
     def to_metadata(self, browser, log, entry_, timeout):  # {{{
-        from calibre.utils.date import parse_date, utcnow
+        from lxml import etree
 
-        douban_id = entry_.get('id')
-        title = entry_.get('title')
-        description = entry_.get('summary')
-        # subtitle = entry_.get('subtitle')  # TODO: std metada doesn't have this field
-        publisher = entry_.get('publisher')
-        isbn = entry_.get('isbn13')  # ISBN11 is obsolute, use ISBN13
-        pubdate = entry_.get('pubdate')
-        authors = entry_.get('author')
-        book_tags = entry_.get('tags')
-        rating = entry_.get('rating')
-        cover_url = entry_.get('images', {}).get('large')
-        series = entry_.get('series')
+        # total_results  = XPath('//openSearch:totalResults')
+        # start_index    = XPath('//openSearch:startIndex')
+        # items_per_page = XPath('//openSearch:itemsPerPage')
+        entry = XPath('//dev[@class="article"]')
+        # entry_id = XPath('descendant::atom:id')
+        # url = XPath('descendant::atom:link[@rel="self"]/@href')
+        authors = XPath('descendant::div[@id="info"]/a[1]')
+        identifier = XPath('descendant::dc:identifier')
+        date = XPath('descendant::dc:date')
+        publisher = XPath('descendant::div[@id="info"]/br[1]')
+        subject = XPath('descendant::div[@id="info"]/br[2]')
+        description = XPath('descendant::div[@class="intro"]')
+        # language = XPath('descendant::dc:language')
+        rating = XPath('descendant::dc:language')
+        cover = XPath('descendant::div[id="mainpic"]//img/@src')
+        isbn = XPath('descendant::div[@id="info"]/br[last()]')
 
-        if not authors:
-            authors = [_('Unknown')]
-        if not douban_id or not title:
+        # print(etree.tostring(entry_, pretty_print=True))
+
+        def get_text(extra, x):
+            try:
+                ans = x(extra)
+                if ans:
+                    ans = ans[0].text
+                    if ans and ans.strip():
+                        return ans.strip()
+            except:
+                log.exception('Programming error:')
+            return None
+
+        result = re.compile(r'<a class=.*? href="(.*?)" target=.*? title="(.*?)">', re.M).search(entry_)
+
+        title = result.group(2)
+        details_url = result.group(1)
+
+        # douban_id = entry_.get('id')
+
+        if not title:
             # Silently discard this entry
             return None
 
-        mi = Metadata(title, authors)
+        mi = Metadata(title)
         mi.identifiers = {'douban': douban_id}
-        mi.publisher = publisher
-        mi.comments = description
-        # mi.subtitle = subtitle
+
+        try:
+            raw = get_details(browser, details_url, timeout)
+            feed = etree.fromstring(
+                xml_to_unicode(clean_ascii_chars(raw), strip_encoding_pats=True)[0],
+                parser=etree.XMLParser(recover=True, no_network=True, resolve_entities=False)
+            )
+            extra = entry(feed)[0]
+        except:
+            log.exception('Failed to get additional details for', mi.title)
+            return mi
+
+        authors = get_text(extra, authors)
+        if not authors:
+            authors = [_('Unknown')]
+
+        mi.authors = authors
+
+        cover_url = cover(extra)
+
+        mi.comments = get_text(extra, description)
+
+        mi.publisher = get_text(extra, publisher)
+
+        mi.subtitle = get_text(extra, subtitle)
 
         # ISBN
         isbns = []
@@ -122,7 +158,9 @@ class Douban(Source):
         mi.tags = [tag['name'] for tag in book_tags]
 
         # pubdate
+        pubdate = get_text(extra, date)
         if pubdate:
+            from calibre.utils.date import parse_date, utcnow
             try:
                 default = utcnow().replace(day=15)
                 mi.pubdate = parse_date(pubdate, assume_utc=True, default=default)
@@ -130,6 +168,7 @@ class Douban(Source):
                 log.error('Failed to parse pubdate %r' % pubdate)
 
         # Ratings
+        rating = get_text(extra, rating)
         if rating:
             try:
                 mi.rating = float(rating['average']) / 2.0
@@ -165,9 +204,6 @@ class Douban(Source):
             from urllib.parse import urlencode
         except ImportError:
             from urllib import urlencode
-        SEARCH_URL = 'https://api.douban.com/v2/book/search?count=10&'
-        ISBN_URL = 'https://api.douban.com/v2/book/isbn/'
-        SUBJECT_URL = 'https://api.douban.com/v2/book/'
 
         q = ''
         t = None
@@ -175,10 +211,8 @@ class Douban(Source):
         subject = identifiers.get('douban', None)
         if isbn is not None:
             q = isbn
-            t = 'isbn'
         elif subject is not None:
             q = subject
-            t = 'subject'
         elif title or authors:
 
             def build_term(prefix, parts):
@@ -192,24 +226,11 @@ class Douban(Source):
             )
             if author_tokens:
                 q += ((' ' if q != '' else '') + build_term('author', author_tokens))
-            t = 'search'
         q = q.strip()
         if not q:
             return None
-        url = None
-        if t == "isbn":
-            url = ISBN_URL + q
-        elif t == 'subject':
-            url = SUBJECT_URL + q
-        else:
-            url = SEARCH_URL + urlencode({
-                'q': q,
-            })
-        if self.DOUBAN_API_KEY and self.DOUBAN_API_KEY != '':
-            if t == "isbn" or t == "subject":
-                url = url + "?apikey=" + self.DOUBAN_API_KEY
-            else:
-                url = url + "&apikey=" + self.DOUBAN_API_KEY
+        url = BASE_URL + urlencode({'q': q})
+
         return url
 
     # }}}
@@ -296,7 +317,7 @@ class Douban(Source):
     ):
         for relevance, i in enumerate(entries):
             try:
-                ans = self.to_metadata(br, log, i, timeout)
+                ans = self.to_metadata(br, log, i[0], timeout)
                 if isinstance(ans, Metadata):
                     ans.source_relevance = relevance
                     db = ans.identifiers['douban']
@@ -342,8 +363,8 @@ class Douban(Source):
         except Exception as e:
             log.exception('Failed to parse identify results')
             return as_unicode(e)
-        if 'books' in j:
-            entries = j['books']
+        if 'items' in j:
+            entries = j['items']
         else:
             entries = []
             entries.append(j)
