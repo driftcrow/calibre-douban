@@ -3,8 +3,10 @@
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+from calibre.rpdb import set_trace
+
 __license__ = 'GPL v3'
-__copyright__ = '2011, Kovid Goyal <kovid@kovidgoyal.net>; 2011, Li Fanxi <lifanxi@freemindworld.com>'
+__copyright__ = '2011, Kovid Goyal <kovid@kovidgoyal.net>; 2011, Li Fanxi <lifanxi@freemindworld.com>; 2021 Driftcrow'
 __docformat__ = 'restructuredtext en'
 
 import time
@@ -36,11 +38,21 @@ def get_details(browser, url, timeout):  # {{{
 # }}}
 
 
+xpath_cache = {}
+
+
+def XPath(x):
+    ans = xpath_cache.get(x)
+    if ans is None:
+        from lxml import etree
+        ans = xpath_cache[x] = etree.XPath(x)
+    return ans
+
 class Douban(Source):
 
     name = 'Douban Books'
-    author = 'Li Fanxi, xcffl, jnozsc'
-    version = (3, 1, 1)
+    author = 'Li Fanxi, xcffl, jnozsc, Driftcrow'
+    version = (3, 2, 1)
     minimum_calibre_version = (2, 80, 0)
 
     description = _(
@@ -75,39 +87,25 @@ class Douban(Source):
         # total_results  = XPath('//openSearch:totalResults')
         # start_index    = XPath('//openSearch:startIndex')
         # items_per_page = XPath('//openSearch:itemsPerPage')
-        entry = XPath('//dev[@class="article"]')
+        # entry = XPath('//div[@class="article"]')
+        entry = XPath('/*')
         # entry_id = XPath('descendant::atom:id')
         # url = XPath('descendant::atom:link[@rel="self"]/@href')
-        authors = XPath('descendant::div[@id="info"]/a[1]')
-        identifier = XPath('descendant::dc:identifier')
-        date = XPath('descendant::dc:date')
-        publisher = XPath('descendant::div[@id="info"]/br[1]')
-        subject = XPath('descendant::div[@id="info"]/br[2]')
-        description = XPath('descendant::div[@class="intro"]')
-        # language = XPath('descendant::dc:language')
-        rating = XPath('descendant::dc:language')
-        cover = XPath('descendant::div[id="mainpic"]//img/@src')
-        isbn = XPath('descendant::div[@id="info"]/br[last()]')
+        authors = XPath('//meta[@property="book:author"]/@content')
+        # identifier = XPath('descendant::identifier')
+        # subject = XPath('descendant::div[@id="info"]/br[2]')
+        description = XPath('string(//div[@class="intro"])')
+        # language = XPath('descendant::language')
+        cover =XPath('//meta[@property="og:image"]/@content')
+        isbn = XPath('//meta[@property="book:isbn"]/@content')
+        rating = XPath('//strong[@property="v:average"]')
+        tags = XPath('string(//div[@id="db-tags-section"]//div[@class="indent"])')
 
-        # print(etree.tostring(entry_, pretty_print=True))
-
-        def get_text(extra, x):
-            try:
-                ans = x(extra)
-                if ans:
-                    ans = ans[0].text
-                    if ans and ans.strip():
-                        return ans.strip()
-            except:
-                log.exception('Programming error:')
-            return None
-
-        result = re.compile(r'<a class=.*? href="(.*?)" target=.*? title="(.*?)">', re.M).search(entry_)
+        result = re.compile(r'<a class=.*? href="(.*?)" target=.*? title="(.*?)" >.*?sid:(.*?),', re.S).search(entry_)
 
         title = result.group(2)
         details_url = result.group(1)
-
-        # douban_id = entry_.get('id')
+        douban_id = result.group(3)
 
         if not title:
             # Silently discard this entry
@@ -118,31 +116,37 @@ class Douban(Source):
 
         try:
             raw = get_details(browser, details_url, timeout)
-            feed = etree.fromstring(
-                xml_to_unicode(clean_ascii_chars(raw), strip_encoding_pats=True)[0],
-                parser=etree.XMLParser(recover=True, no_network=True, resolve_entities=False)
-            )
+            feed = etree.HTML(raw.decode('utf-8'))
             extra = entry(feed)[0]
         except:
             log.exception('Failed to get additional details for', mi.title)
             return mi
 
-        authors = get_text(extra, authors)
+        info = etree.tostring(etree.XPath('//div[@id="info"]')(extra)[0], encoding='utf8').decode()
+        # result = re.compile(r'出版社:</span>(.*?)<.*?副标题:</span>(.*?)<.*?出版年:</span>(.*?)<.*?丛书:</span>.*?>(.*?)</a>', re.S).search(info)
+        result = re.compile(r'出版社:</span>(.*?<a.*?>)*(.*?)<', re.M).search(info)
+        if result:
+            mi.publisher = result.group(2).strip()
+
+        result = re.compile(r'副标题:</span>(.*?)<', re.M).search(info)
+        if result:
+            mi.subtitle = result.group(1).strip()
+
+        authors =  authors(extra)[0]
         if not authors:
-            authors = [_('Unknown')]
+            authors = [('Unknown')]
 
-        mi.authors = authors
+        mi.authors = authors.split('、')    # TODO:: others split char
 
-        cover_url = cover(extra)
+        cover_url = cover(extra)[0]
 
-        mi.comments = get_text(extra, description)
+        mi.comments = description(extra)
 
-        mi.publisher = get_text(extra, publisher)
 
-        mi.subtitle = get_text(extra, subtitle)
 
         # ISBN
         isbns = []
+        isbn =  isbn(extra)[0]
         if isinstance(isbn, (type(''), bytes)):
             if check_isbn(isbn):
                 isbns.append(isbn)
@@ -155,10 +159,16 @@ class Douban(Source):
         mi.all_isbns = isbns
 
         # Tags
-        mi.tags = [tag['name'] for tag in book_tags]
+        tags = [ tag.strip() for tag in tags(extra).split("\n") if tag.strip() != '']
+        # tags = tags(extra)[0].split(" ")
+        mi.tags = tags
 
         # pubdate
-        pubdate = get_text(extra, date)
+
+        result = re.compile(r'出版年:</span>(.*?)<', re.M).search(info)
+        if result:
+            pubdate = result.group(1)
+
         if pubdate:
             from calibre.utils.date import parse_date, utcnow
             try:
@@ -168,10 +178,10 @@ class Douban(Source):
                 log.error('Failed to parse pubdate %r' % pubdate)
 
         # Ratings
-        rating = get_text(extra, rating)
+        rating = rating(extra)[0].text
         if rating:
             try:
-                mi.rating = float(rating['average']) / 2.0
+                mi.rating = float(rating) / 2.0
             except:
                 log.exception('Failed to parse rating')
                 mi.rating = 0
@@ -185,8 +195,9 @@ class Douban(Source):
                 mi.has_douban_cover = u
 
         # Series
-        if series:
-            mi.series = series['title']
+        result = re.compile(r'丛书:</span>(.*?<a.*?>)*(.*?)<', re.M).search(info)
+        if result:
+            mi.series = result.group(2)
 
         return mi
 
@@ -229,8 +240,8 @@ class Douban(Source):
         q = q.strip()
         if not q:
             return None
-        url = BASE_URL + urlencode({'q': q})
 
+        url = self.BASE_URL + urlencode({'q': q})
         return url
 
     # }}}
@@ -317,7 +328,7 @@ class Douban(Source):
     ):
         for relevance, i in enumerate(entries):
             try:
-                ans = self.to_metadata(br, log, i[0], timeout)
+                ans = self.to_metadata(br, log, i, timeout)
                 if isinstance(ans, Metadata):
                     ans.source_relevance = relevance
                     db = ans.identifiers['douban']
