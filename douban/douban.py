@@ -133,11 +133,13 @@ class Douban(Source):
         if result:
             mi.subtitle = result.group(1).strip()
 
-        authors =  authors(extra)[0]
+        authors =  authors(extra)
         if not authors:
             authors = [('Unknown')]
+        else:
+            authors = authors[0].split('、')    # TODO:: others split char
 
-        mi.authors = authors.split('、')    # TODO:: others split char
+        mi.authors = authors
 
         cover_url = cover(extra)[0]
 
@@ -165,7 +167,7 @@ class Douban(Source):
         mi.tags = tags
 
         # pubdate
-
+        pubdate = ''
         result = re.compile(r'出版年:</span>(.*?)<', re.M).search(info)
         if result:
             pubdate = result.group(1)
