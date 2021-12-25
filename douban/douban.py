@@ -113,6 +113,7 @@ class Douban(Source):
 
         mi = Metadata(title)
         mi.identifiers = {'douban': douban_id}
+        mi.language = 'Chinese'
 
         try:
             raw = get_details(browser, details_url, timeout)
